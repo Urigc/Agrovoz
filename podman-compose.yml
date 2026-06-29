@@ -1,0 +1,234 @@
+# ============================================================
+# AgroVoz — podman-compose.yml
+#
+# Orquestación de contenedores ROOTLESS con Podman.
+# Todos los servicios comparten la red interna "agrovoz_net".
+#
+# Orden de arranque:
+#   postgres + redis → servicio_stt → backend_api → servicio_tts → cliente_ingesta
+#
+# Uso:
+#   podman-compose up -d              # levantar todo en background
+#   podman-compose logs -f backend_api  # seguir logs de un servicio
+#   podman-compose down               # bajar y limpiar
+# ============================================================
+
+version: "3.9"
+
+# ---------- Volúmenes persistentes ----------
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  piper_models:
+    driver: local
+  whisper_models:
+    driver: local
+
+# ---------- Red interna ----------
+networks:
+  agrovoz_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ============================================================
+# SERVICIOS
+# ============================================================
+services:
+
+  # ----------------------------------------------------------
+  # INFRAESTRUCTURA: PostgreSQL 16 + pgvector
+  # Base de datos híbrida: tablas relacionales + vectores RAG
+  # ----------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agrovoz_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Migraciones auto-ejecutadas al primer arranque
+      - ./infra/db/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - agrovoz_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # INFRAESTRUCTURA: Redis 7 con persistencia AOF
+  # Bus de eventos asíncrono (Redis Streams)
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: agrovoz_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --loglevel notice
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - agrovoz_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # PRIMER TERCIO: Cliente de Ingesta de Audio
+  # Captura PCM 16kHz → Silero VAD → Redis Stream "agrovoz:audio"
+  #
+  # Requiere acceso al dispositivo de audio del host.
+  # En Podman rootless, pasar el dispositivo explícitamente.
+  # ----------------------------------------------------------
+  cliente_ingesta:
+    build:
+      context: ./cliente_ingesta
+      dockerfile: Containerfile
+    container_name: agrovoz_cliente_ingesta
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: ${REDIS_URL}
+      REDIS_STREAM_AUDIO: ${REDIS_STREAM_AUDIO}
+      VAD_THRESHOLD: ${VAD_THRESHOLD}
+      VAD_MIN_SILENCE_MS: ${VAD_MIN_SILENCE_MS}
+      VAD_MIN_SPEECH_MS: ${VAD_MIN_SPEECH_MS}
+      VAD_PRE_SPEECH_PAD_MS: ${VAD_PRE_SPEECH_PAD_MS}
+      AUDIO_SAMPLE_RATE: ${AUDIO_SAMPLE_RATE}
+      AUDIO_CHUNK_FRAMES: ${AUDIO_CHUNK_FRAMES}
+    volumes:
+      - ./cliente_ingesta:/app:ro
+    # Acceso al micrófono del host (ajustar índice de dispositivo si es necesario)
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
+    networks:
+      - agrovoz_net
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ----------------------------------------------------------
+  # SEGUNDO TERCIO: Servicio STT (Whisper vía CTranslate2)
+  # Consumer de "agrovoz:audio" → produce en "agrovoz:texto"
+  # (Imagen y código generados en la siguiente fase)
+  # ----------------------------------------------------------
+  servicio_stt:
+    build:
+      context: ./servicio_stt
+      dockerfile: Containerfile
+    container_name: agrovoz_stt
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: ${REDIS_URL}
+      REDIS_STREAM_AUDIO: ${REDIS_STREAM_AUDIO}
+      REDIS_STREAM_TEXTO: ${REDIS_STREAM_TEXTO}
+      REDIS_GROUP_STT: ${REDIS_GROUP_STT}
+      WHISPER_MODEL: ${WHISPER_MODEL}
+      WHISPER_DEVICE: ${WHISPER_DEVICE}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE}
+    volumes:
+      - whisper_models:/models/whisper
+      - ./servicio_stt:/app:ro
+    networks:
+      - agrovoz_net
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - segundo_tercio
+      - full
+
+  # ----------------------------------------------------------
+  # SEGUNDO TERCIO: Backend API (FastAPI + Gemini + RAG)
+  # Consumer de "agrovoz:texto" → lógica de negocio → PostgreSQL
+  # ----------------------------------------------------------
+  backend_api:
+    build:
+      context: ./backend_api
+      dockerfile: Containerfile
+    container_name: agrovoz_backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      REDIS_STREAM_TEXTO: ${REDIS_STREAM_TEXTO}
+      REDIS_STREAM_RESPUESTA: ${REDIS_STREAM_RESPUESTA}
+      REDIS_GROUP_BACKEND: ${REDIS_GROUP_BACKEND}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL}
+      RAG_TOP_K: ${RAG_TOP_K}
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend_api:/app:ro
+    networks:
+      - agrovoz_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles:
+      - segundo_tercio
+      - full
+
+  # ----------------------------------------------------------
+  # TERCER TERCIO: Servicio TTS (Piper local + ElevenLabs fallback)
+  # Consumer de "agrovoz:respuesta" → audio WAV al cliente
+  # ----------------------------------------------------------
+  servicio_tts:
+    build:
+      context: ./servicio_tts
+      dockerfile: Containerfile
+    container_name: agrovoz_tts
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: ${REDIS_URL}
+      REDIS_STREAM_RESPUESTA: ${REDIS_STREAM_RESPUESTA}
+      REDIS_GROUP_TTS: ${REDIS_GROUP_TTS}
+      PIPER_MODEL_PATH: ${PIPER_MODEL_PATH}
+      PIPER_CONFIG_PATH: ${PIPER_CONFIG_PATH}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID}
+    volumes:
+      - piper_models:/models/piper
+      - ./servicio_tts:/app:ro
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
+    networks:
+      - agrovoz_net
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - tercer_tercio
+      - full
