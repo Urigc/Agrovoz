@@ -1,0 +1,59 @@
+# ===========================================================
+# backend_api/Containerfile
+#
+# Imagen del backend API de AgroVoz.
+# Incluye: FastAPI + Gemini + sentence-transformers + asyncpg + pgvector
+#
+# El modelo de embeddings (~420MB) se descarga en el primer
+# arranque y se persiste en el volumen embeddings_models.
+# ===========================================================
+
+FROM python:3.11-slim
+
+LABEL org.opencontainers.image.title="AgroVoz Backend API"
+LABEL org.opencontainers.image.description="FastAPI + Gemini + pgvector RAG + Redis Consumer"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # Caché de modelos HuggingFace (sentence-transformers)
+    HF_HOME=/models/embeddings \
+    TRANSFORMERS_CACHE=/models/embeddings \
+    SENTENCE_TRANSFORMERS_HOME=/models/embeddings
+
+# Dependencias del sistema para asyncpg y CTranslate2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq-dev \
+        libgomp1 \
+        curl \
+        wget \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Usuario no-root
+RUN groupadd -g 1001 agrovoz \
+    && useradd -u 1001 -g agrovoz -m -s /bin/bash agrovoz
+
+WORKDIR /app
+RUN mkdir -p /models/embeddings && chown -R agrovoz:agrovoz /models /app
+
+# Copiar código
+COPY --chown=agrovoz:agrovoz shared/       /app/shared/
+COPY --chown=agrovoz:agrovoz backend_api/  /app/
+
+# Instalar torch CPU primero (capa independiente para caché)
+RUN pip install --no-cache-dir torch==2.3.1+cpu \
+        --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Resto de dependencias
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+USER agrovoz
+
+# Healthcheck via el endpoint /health de FastAPI
+HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:${BACKEND_PORT:-8000}/health || exit 1
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
