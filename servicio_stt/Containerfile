@@ -1,0 +1,48 @@
+# ===========================================================
+# servicio_stt/Containerfile
+#
+# Imagen para el servicio de transcripción de voz.
+# Motor: faster-whisper (CTranslate2) — 4x más rápido que Whisper original.
+#
+# El modelo 'small' (~460MB) se descarga de HuggingFace en el primer
+# arranque y se persiste en el volumen whisper_models.
+# ===========================================================
+
+FROM python:3.11-slim
+
+LABEL org.opencontainers.image.title="AgroVoz Servicio STT"
+LABEL org.opencontainers.image.description="Consumer Redis → Whisper CTranslate2 → Redis"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # Directorio de caché del modelo Whisper (HuggingFace Hub)
+    HF_HOME=/models/whisper \
+    TRANSFORMERS_CACHE=/models/whisper
+
+# Dependencias del sistema para CTranslate2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+        wget \
+        curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Usuario no-root
+RUN groupadd -g 1001 agrovoz \
+    && useradd -u 1001 -g agrovoz -m -s /bin/bash agrovoz
+
+WORKDIR /app
+RUN mkdir -p /models/whisper && chown -R agrovoz:agrovoz /models /app
+
+COPY --chown=agrovoz:agrovoz shared/ /app/shared/
+COPY --chown=agrovoz:agrovoz servicio_stt/ /app/
+
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+USER agrovoz
+
+HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=3 \
+    CMD python -c "from faster_whisper import WhisperModel; print('OK')" || exit 1
+
+CMD ["python", "main.py"]
